@@ -1,0 +1,5 @@
+- name: webshop_agent
+  _target_: agent_system.environments.webshop.webshop_agent_loop.WebshopAgentLoop
+  max_steps: 15
+  env_timeout: 30.0
+  invalid_tool_call_penalty: 0.05

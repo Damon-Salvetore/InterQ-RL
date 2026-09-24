@@ -522,6 +522,14 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "scale_format": getattr(self._qat_config, "scale_format", "auto"),
+                "scale_round": getattr(self._qat_config, "scale_round", "ceil"),
+                "quantize_kv_cache": getattr(self._qat_config, "quantize_kv_cache", False),
+                "backward_operand_policy": getattr(
+                    self._qat_config,
+                    "backward_operand_policy",
+                    "save",
+                ),
             },
         )
         enable_qat_fuse(module)
@@ -953,7 +961,8 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items()
             )
 
-        if self._qat_enabled:
+        if self._qat_enabled and not str(self._qat_config.mode).lower().endswith("_fp8"):
+            # FP8 modes sync bf16 weights; the rollout quantizes them online.
             from verl.utils.qat.quantizer import QATQuantizer
             from verl.utils.torch_dtypes import PrecisionType
 

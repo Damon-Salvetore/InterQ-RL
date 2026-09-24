@@ -1369,6 +1369,115 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("ais")  # type: ignore[arg-type]
+def compute_policy_loss_ais(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """AIS: vanilla PPO with AIS weights as rollout_is_weights."""
+
+    if rollout_is_weights is None:
+        raise ValueError("ais requires rollout_is_weights")
+    return compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+
+@register_policy_loss("qurl")  # type: ignore[arg-type]
+def compute_policy_loss_qurl(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    acr_clip_r: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """QuRL Adaptive Clipping Range.
+
+        J = E[ scale * min( R A, clip(R, 1 - eps, (1 + eps) / r) A ) ],  R = pi_theta / pi_old,
+
+    with scale = min(rho, C) from rollout_is_weights and r = min(1, C / rho) from acr_clip_r.
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    if rollout_is_weights is None:
+        raise ValueError("qurl requires rollout_is_weights")
+    if acr_clip_r is None:
+        raise ValueError("qurl requires acr_clip_r")
+
+    clip_ratio = config.clip_ratio
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    r = torch.where(response_mask.bool(), acr_clip_r, torch.ones_like(acr_clip_r))
+    upper = (1.0 + cliprange_high) / torch.clamp(r, min=1e-6)
+
+    pg_losses1 = -advantages * ratio
+    clipped_ratio = torch.minimum(
+        torch.clamp(ratio, min=1.0 - cliprange_low), upper
+    )
+    pg_losses2 = -advantages * clipped_ratio
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+    return pg_loss, {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+        "acr/upper_bound_mean": verl_F.masked_mean(upper, response_mask).detach().item(),
+    }
+
+
+@register_policy_loss("interq_rl")  # type: ignore[arg-type]
+def compute_policy_loss_interq_rl(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """InterQ-RL: vanilla PPO with InterQ-RL weights as rollout_is_weights."""
+
+    if rollout_is_weights is None:
+        raise ValueError(
+            "interq_rl requires rollout_is_weights"
+        )
+    return compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+
 @register_policy_loss("dppo_tv")
 def compute_policy_loss_dppo_tv(
     old_log_prob: torch.Tensor,

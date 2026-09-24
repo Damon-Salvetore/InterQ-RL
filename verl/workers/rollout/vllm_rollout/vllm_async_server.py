@@ -90,6 +90,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def build_fp8_block_quant_config(num_hidden_layers: int) -> dict[str, Any]:
+    """Online blockwise FP8 config; lm_head and the MoE gate stay unquantized."""
+    ignored_layers = ["lm_head"]
+    ignored_layers.extend(f"model.layers.{layer}.mlp.gate" for layer in range(num_hidden_layers))
+    return {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "ignored_layers": ignored_layers,
+    }
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -795,7 +808,12 @@ class vLLMHttpServer:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
-            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+            wake_tags = tags or self._get_wake_up_tags()
+            if "kv_cache" in wake_tags:
+                # Flush worker allocators before cuMemCreate remaps the KV-cache arena.
+                memory_stats = await self.engine.collective_rpc("empty_cache")
+                logger.warning("Pre-KV-wake worker memory: %s", memory_stats)
+            await self.engine.wake_up(tags=wake_tags)
             await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
@@ -1051,9 +1069,10 @@ class vLLMHttpServer:
         quantization = self.config.quantization
         hf_overrides = {}
 
-        # Handle QAT (Quantization-Aware Training) configuration
+        # FP8 QAT modes quantize only the training forward; the rollout takes the native fp8 path below.
         qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
+        _qat_is_fp8 = str(qat_config_dict.get("mode", "")).lower().endswith("_fp8")
+        if qat_config_dict.get("enable", False) and not _qat_is_fp8:
             from verl.utils.qat import QATConfig, load_quantization_config
 
             qat_config = QATConfig(**qat_config_dict)
@@ -1082,18 +1101,9 @@ class vLLMHttpServer:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
             if quantization == "fp8":
-                # Ignore MoE router layers for FP8 quantization
-                all_mlp_gate_layers = []
-                for layer in range(self.model_config.hf_config.num_hidden_layers):
-                    all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
-
-                FP8_BLOCK_QUANT_KWARGS = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                    "ignored_layers": all_mlp_gate_layers,
-                }
+                FP8_BLOCK_QUANT_KWARGS = build_fp8_block_quant_config(
+                    self.model_config.hf_config.num_hidden_layers
+                )
                 hf_overrides["quantization_config"] = dict(FP8_BLOCK_QUANT_KWARGS)
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.

@@ -19,6 +19,7 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pprint import pprint
@@ -36,6 +37,9 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import KVBatchMeta
 
+from interq_rl.ais import compute_ais_weights
+from interq_rl.core_interq import compute_interq_weights
+from interq_rl.qurl import compute_acr_weights
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
@@ -100,8 +104,24 @@ def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
     params["temperature"] = 0
 
 
+def build_ray_worker_env(
+    environ: Mapping[str, str] | None = None,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Pass NCCL settings and explicit overrides to Ray workers."""
+
+    source = os.environ if environ is None else environ
+    result = {key: value for key, value in source.items() if key.startswith("NCCL_")}
+    for key, value in (overrides or {}).items():
+        result[str(key)] = str(value)
+    return result
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+BATCH_CORRECTION_LOSS_MODES = frozenset({"ais", "interq_rl", "qurl"})
 
 
 def _tq_supports_checkpoint() -> bool:
@@ -231,6 +251,21 @@ class PPOTrainer(ABC):
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.config.trainer.device
+        configured_worker_env = OmegaConf.select(
+            self.config,
+            "trainer.worker_env",
+            default={},
+        )
+        worker_env = build_ray_worker_env(
+            overrides=OmegaConf.to_container(
+                configured_worker_env,
+                resolve=True,
+            )
+            if configured_worker_env
+            else {},
+        )
+        if worker_env:
+            wg_kwargs["worker_env"] = worker_env
         logger.info(f"worker group kwargs: {wg_kwargs}")
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -1530,6 +1565,11 @@ class PPOTrainer(ABC):
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
+        policy_loss_mode = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.actor.policy_loss.loss_mode",
+            default="vanilla",
+        )
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
@@ -1571,14 +1611,64 @@ class PPOTrainer(ABC):
             config=self.config.algorithm,
         )
 
+        batch_correction = policy_loss_mode in BATCH_CORRECTION_LOSS_MODES
+        if batch_correction:
+            if rollout_corr_config is not None and (
+                rollout_corr_config.get("rollout_is", None) is not None
+                or rollout_corr_config.get("rollout_rs", None) is not None
+            ):
+                raise ValueError(f"{policy_loss_mode} cannot be combined with another rollout correction")
+            if "rollout_is_weights" in data.batch:
+                raise ValueError(
+                    f"{policy_loss_mode} found pre-existing rollout_is_weights"
+                )
+            old_log_probs = data.batch.get("old_log_probs", None)
+            rollout_log_probs = data.batch.get("rollout_log_probs", None)
+            if old_log_probs is None or rollout_log_probs is None:
+                raise ValueError(f"{policy_loss_mode} requires both old_log_probs and rollout_log_probs")
+            policy_config = self.config.actor_rollout_ref.actor.policy_loss
+            if policy_loss_mode == "qurl":
+                correction_weights, acr_clip_r, correction_metrics = compute_acr_weights(
+                    old_log_prob=old_log_probs,
+                    rollout_log_prob=rollout_log_probs,
+                    response_mask=data.batch["response_mask"],
+                    cap=float(policy_config.get("acr_cap", 2.0)),
+                )
+                data.batch["acr_clip_r"] = acr_clip_r
+            elif policy_loss_mode == "ais":
+                correction_weights, correction_metrics = compute_ais_weights(
+                    old_log_prob=old_log_probs,
+                    rollout_log_prob=rollout_log_probs,
+                    advantages=data.batch["advantages"],
+                    response_mask=data.batch["response_mask"],
+                    clip=float(policy_config.get("ais_clip", 5.0)),
+                    delta=float(policy_config.get("ais_delta", 0.02)),
+                    gamma=float(policy_config.get("ais_gamma", 1.2)),
+                    beta_var=float(policy_config.get("ais_beta_var", 1.0)),
+                    epsilon=float(policy_config.get("ais_epsilon", 1e-6)),
+                )
+            else:
+                correction_weights, correction_metrics = compute_interq_weights(
+                    old_log_prob=old_log_probs,
+                    rollout_log_prob=rollout_log_probs,
+                    response_mask=data.batch["response_mask"],
+                    eps_low=float(policy_config.get("interq_eps_low", 0.025)),
+                    eps_high=float(policy_config.get("interq_eps_high", 0.05)),
+                    exponent=float(policy_config.get("interq_exponent", 0.5)),
+                )
+            data.batch["rollout_is_weights"] = correction_weights
+            metrics.update(correction_metrics)
+
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
-        if rollout_correction:
+        if rollout_correction or batch_correction:
             fields.append("response_mask")
             if "rollout_is_weights" in data.batch:
                 fields.append("rollout_is_weights")
+            if "acr_clip_r" in data.batch:
+                fields.append("acr_clip_r")
 
         output = {}
         for field in fields:

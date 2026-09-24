@@ -1,0 +1,8 @@
+- name: scienceworld_agent
+  _target_: agent_system.environments.scienceworld.scienceworld_agent_loop.ScienceWorldAgentLoop
+  max_steps: 100
+  env_step_limit: 100
+  env_pool_size: 16
+  max_generation_tokens: 32
+  max_action_candidates: 1
+  action_adapter_mode: direct

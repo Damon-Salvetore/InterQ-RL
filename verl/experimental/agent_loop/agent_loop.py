@@ -78,6 +78,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _trajectory_run_kwargs(
+    sample_kwargs: dict[str, Any],
+    trajectory: dict[str, Any],
+) -> dict[str, Any]:
+    """Pass the training step, sample index, session id and validate flag to the agent loop."""
+    kwargs = dict(sample_kwargs)
+    session_id = int(
+        kwargs.get("session_id", trajectory["rollout_n"])
+    )
+    kwargs["global_steps"] = trajectory["step"]
+    kwargs["sample_index"] = trajectory["sample_index"]
+    kwargs["rollout_n"] = session_id
+    kwargs["session_id"] = session_id
+    kwargs["validate"] = trajectory["validate"]
+    return kwargs
+
+
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
@@ -478,7 +495,9 @@ def register(agent_name: str):
 
     def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
         fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
-        _agent_loop_registry[agent_name] = {"_target_": fqdn}
+        # Keep kwargs registered from the agent-loop config before hydra lazily imports this module.
+        if agent_name not in _agent_loop_registry:
+            _agent_loop_registry[agent_name] = {"_target_": fqdn}
         return subclass
 
     return decorator
@@ -690,8 +709,16 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            run_kwargs = _trajectory_run_kwargs(kwargs, trajectory)
+            output: AgentLoopOutput = await agent_loop.run(
+                sampling_params,
+                **run_kwargs,
+            )
+            return await self._agent_loop_postprocess(
+                output,
+                trajectory["validate"],
+                **kwargs,
+            )
 
     def _pad_token_ids(
         self,

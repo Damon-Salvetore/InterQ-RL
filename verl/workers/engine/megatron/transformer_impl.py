@@ -109,13 +109,20 @@ class MegatronEngine(BaseEngine):
         # QAT configuration
         self._qat_config = getattr(self.engine_config, "qat", None)
         self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
+        self._qat_backend = None
         if self._qat_enabled:
             if self.engine_config.vanilla_mbridge:
                 raise ValueError(
                     "QAT requires non-vanilla Megatron bridge. "
                     "Please set 'use_mbridge=True' and 'vanilla_mbridge=False'."
                 )
-            logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
+            from verl.utils.qat.megatron import resolve_megatron_qat_backend
+
+            self._qat_backend = resolve_megatron_qat_backend(self._qat_config.mode)
+            logger.info(
+                f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}, "
+                f"backend={self._qat_backend}"
+            )
 
         # Router replay configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
@@ -165,6 +172,50 @@ class MegatronEngine(BaseEngine):
             **extra_args,
         )
 
+    def _configure_qat_provider(self, provider) -> None:
+        """Select a quantized layer spec only for ModelOpt-owned QAT modes."""
+        if not self._qat_enabled:
+            return
+        if self._qat_backend == "verl_fp8":
+            return
+        if self._qat_backend == "modelopt":
+            from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
+
+            provider.transformer_layer_spec = modelopt_transformer_layer_spec
+            return
+        raise RuntimeError(f"Unknown Megatron QAT backend: {self._qat_backend!r}")
+
+    def _apply_configured_qat(self) -> None:
+        """Apply the configured QAT implementation."""
+        if not self._qat_enabled:
+            return
+        if self._qat_backend == "verl_fp8":
+            from verl.utils.qat.megatron import apply_megatron_fp8_qat
+
+            self.module = apply_megatron_fp8_qat(self.module, self._qat_config)
+            return
+        if self._qat_backend == "modelopt":
+            from verl.utils.modelopt import apply_qat_to_modules
+
+            self.module = apply_qat_to_modules(self.module, self._qat_config)
+            return
+        raise RuntimeError(f"Unknown Megatron QAT backend: {self._qat_backend!r}")
+
+    def _process_qat_weight_export(self, per_tensor_param):
+        """Keep W8A8 master weights BF16 for verl's standard FP8 weight sync."""
+        if not self._qat_enabled or self._qat_backend == "verl_fp8":
+            return per_tensor_param
+        if self._qat_backend == "modelopt":
+            from verl.utils.modelopt import export_qat_weights
+
+            return export_qat_weights(
+                per_tensor_param,
+                self.module,
+                self._qat_config.mode,
+                self.bridge,
+            )
+        raise RuntimeError(f"Unknown Megatron QAT backend: {self._qat_backend!r}")
+
     def _build_tf_config(self):
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
         from verl.utils.torch_dtypes import PrecisionType
@@ -204,7 +255,10 @@ class MegatronEngine(BaseEngine):
             tf_config.fp16 = self.param_dtype == torch.float16
             tf_config.bf16 = self.param_dtype == torch.bfloat16
         else:
-            from verl.models.mcore.bridge import AutoBridge
+            from verl.models.mcore.bridge import (
+                AutoBridge,
+                apply_provider_overrides_and_finalize,
+            )
 
             # Use Megatron-Bridge to convert HF config to Megatron config
             bridge = AutoBridge.from_hf_pretrained(
@@ -251,12 +305,10 @@ class MegatronEngine(BaseEngine):
                 else:
                     provider_overrides["enable_routing_replay"] = True
 
-            if self._qat_enabled:
-                from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
+            self._configure_qat_provider(provider)
 
-                provider.transformer_layer_spec = modelopt_transformer_layer_spec
-
-            provider.apply_overrides_and_finalize(
+            apply_provider_overrides_and_finalize(
+                provider,
                 dtype=self.param_dtype,
                 overrides=provider_overrides,
             )
@@ -323,6 +375,8 @@ class MegatronEngine(BaseEngine):
             wrap_with_ddp=wrap_with_ddp,
             use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
             use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
+            # Weights are loaded right after construction; random init is not synchronized.
+            data_parallel_random_init=False,
         )
         override_ddp_config = self._resolve_override_ddp_config()
 
@@ -340,7 +394,8 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
+        # DCP may be on for saving while the initial weights still come from HuggingFace.
+        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )
@@ -421,9 +476,7 @@ class MegatronEngine(BaseEngine):
         self.module = self._build_megatron_module()
 
         if self._qat_enabled and not self.engine_config.forward_only:
-            from verl.utils.modelopt import apply_qat_to_modules
-
-            self.module = apply_qat_to_modules(self.module, self._qat_config)
+            self._apply_configured_qat()
 
         self._maybe_enable_fused_kernels()
 
@@ -826,11 +879,7 @@ class MegatronEngine(BaseEngine):
                 else self.bridge.export_hf_weights(self.module)
             )
 
-        # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM
-        if self._qat_enabled:
-            from verl.utils.modelopt import export_qat_weights
-
-            per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+        per_tensor_param = self._process_qat_weight_export(per_tensor_param)
 
         return per_tensor_param, peft_config
 
