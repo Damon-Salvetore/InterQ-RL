@@ -248,15 +248,110 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         del v, param_lp, param_scale
 
 
+# Layout of a quantized layer before vLLM's kernel transform, restored before each refit.
+_PRE_TRANSFORM_META_ATTR = "_verl_pre_transform_param_meta"
+
+# vLLM skips layers carrying this flag; it is cleared before each refit.
+_ALREADY_PROCESSED_ATTR = "_already_called_process_weights_after_loading"
+
+
+def snapshot_pre_transform_params(layer) -> None:
+    """Record the pre-kernel-format layout of a quantized layer's parameters."""
+    if getattr(layer, _PRE_TRANSFORM_META_ATTR, None) is not None:
+        return
+
+    base_param_attrs = dir(torch.nn.Parameter)
+    meta = {}
+    for name, param in layer.named_parameters(recurse=False):
+        if param is None:
+            continue
+        # Metadata only, no tensor copy.
+        attrs = {}
+        for attr in dir(param):
+            if attr in base_param_attrs or attr.startswith("__"):
+                continue
+            try:
+                attrs[attr] = getattr(param, attr)
+            except AttributeError:
+                pass
+        meta[name] = {
+            "shape": tuple(param.shape),
+            "dtype": param.dtype,
+            "device": param.device,
+            "attrs": attrs,
+            "subclass_type": getattr(param, "subclass_type", type(param)),
+        }
+    if meta:
+        setattr(layer, _PRE_TRANSFORM_META_ATTR, meta)
+
+
+def _restore_pre_transform_params(layer) -> bool:
+    meta = getattr(layer, _PRE_TRANSFORM_META_ATTR, None)
+    if not meta:
+        return False
+
+    restored = False
+    for name, spec in meta.items():
+        current = getattr(layer, name, None)
+        if current is None:
+            continue
+        if tuple(current.shape) == spec["shape"] and current.dtype == spec["dtype"]:
+            continue
+        param = torch.nn.Parameter(
+            torch.zeros(spec["shape"], dtype=spec["dtype"], device=spec["device"]),
+            requires_grad=False,
+        )
+        for attr, value in spec["attrs"].items():
+            try:
+                setattr(param, attr, value)
+            except AttributeError:
+                pass
+        subclass_type = spec["subclass_type"]
+        if subclass_type is not torch.nn.Parameter:
+            param.subclass_type = subclass_type
+        setattr(layer, name, param)
+        restored = True
+    return restored
+
+
+def _iter_quantized_layers(model):
+    for module in model.modules():
+        if getattr(module, _PRE_TRANSFORM_META_ATTR, None):
+            yield module
+
+
+def prepare_fp8_weights_for_loading(model) -> bool:
+    """Roll quantized layers back to checkpoint layout so a refit can write them."""
+    restored = False
+    for layer in _iter_quantized_layers(model):
+        restored |= _restore_pre_transform_params(layer)
+    return restored
+
+
+def process_fp8_weights_after_loading(model) -> None:
+    """Re-apply each layer's backend kernel-format transform after a refit."""
+    for layer in _iter_quantized_layers(model):
+        quant_method = getattr(layer, "quant_method", None)
+        if quant_method is not None and hasattr(quant_method, "process_weights_after_loading"):
+            if hasattr(layer, _ALREADY_PROCESSED_ATTR):
+                delattr(layer, _ALREADY_PROCESSED_ATTR)
+            quant_method.process_weights_after_loading(layer)
+
+
 def prepare_quanted_weights_for_loading(model_runner):
     model = model_runner.model
-    if not is_deepseek_v4_model(model):
-        return False
-    return prepare_deepseek_v4_weights_for_loading(model, _copy_param_subclass_attrs)
+    if is_deepseek_v4_model(model):
+        return prepare_deepseek_v4_weights_for_loading(model, _copy_param_subclass_attrs)
+    return prepare_fp8_weights_for_loading(model)
 
 
 def process_quanted_weights_after_loading(model_runner, reload_state):
-    process_deepseek_v4_weights_after_loading(model_runner.model, reload_state)
+    model = model_runner.model
+    if is_deepseek_v4_model(model):
+        process_deepseek_v4_weights_after_loading(model, reload_state)
+        return
+    if reload_state:
+        process_fp8_weights_after_loading(model)
 
 
 def load_quanted_weights(weights, model_runner, is_drafter=False, prepare_model=True, process_model=True):
@@ -333,6 +428,7 @@ def _restore_layer_param_subclass_attrs(layer: torch.nn.Module, old_params: dict
 
 def _make_process_weights_after_loading_for_vllm20(original_fn):
     def _patched_process_weights_after_loading(self, layer) -> None:
+        snapshot_pre_transform_params(layer)
         old_params = dict(layer.named_parameters(recurse=False))
         with patch(
             "vllm.model_executor.layers.quantization.fp8.replace_parameter", replace_parameter_preserve_subclass
@@ -746,22 +842,21 @@ def apply_vllm_fp8_patches():
     # maybe_post_process_fp8_weight_block. Keep its native transformation logic,
     # but preserve parameter subclass metadata for RL weight reloads.
     if vllm_ver >= version.parse("0.20.0"):
-        from vllm.model_executor.layers.quantization.fp8 import (
-            Fp8LinearMethod,
-            Fp8MoEMethod,
-        )
+        from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 
-        patcher1 = patch(
-            func1_path,
-            _make_process_weights_after_loading_for_vllm20(Fp8LinearMethod.process_weights_after_loading),
-        )
-        patcher2 = patch(
-            func2_path,
-            _make_process_weights_after_loading_for_vllm20(Fp8MoEMethod.process_weights_after_loading),
-        )
-        patcher1.start()
-        patcher2.start()
-        fp8_state.vllm_patches.extend([patcher1, patcher2])
+        # Online (BF16-checkpoint) methods override process_weights_after_loading, so each class is patched.
+        patchers = []
+        for cls_name in ("Fp8LinearMethod", "Fp8MoEMethod", "Fp8OnlineLinearMethod", "Fp8OnlineMoEMethod"):
+            cls = getattr(vllm_fp8, cls_name, None)
+            if cls is None or "process_weights_after_loading" not in cls.__dict__:
+                continue
+            patcher = patch(
+                f"vllm.model_executor.layers.quantization.fp8.{cls_name}.process_weights_after_loading",
+                _make_process_weights_after_loading_for_vllm20(cls.__dict__["process_weights_after_loading"]),
+            )
+            patcher.start()
+            patchers.append(patcher)
+        fp8_state.vllm_patches.extend(patchers)
         return
 
     # Linear patch: v0.14+ keeps weight_scale_inv, v0.11-v0.12 renames to weight_scale

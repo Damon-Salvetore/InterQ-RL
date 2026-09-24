@@ -1042,3 +1042,53 @@ def process_validation_metrics(
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
     return data_src2var2metric2val
+
+
+def process_validation_overall_metrics(data_sources: list[str], infos_dict: dict[str, list[Any]]) -> dict[str, float]:
+    """Benchmark-level validation metrics.
+
+    WebShop: Score (mean task_score) and Success Rate. Sources whose samples carry a task_name
+    (ScienceWorld): reward averaged within each task and then across tasks, and the solved rate
+    over all episodes.
+    """
+    metrics: dict[str, float] = {}
+
+    task_scores = infos_dict.get("task_score")
+    successes = infos_dict.get("success")
+    if task_scores is not None and successes is not None:
+        source2scores = defaultdict(list)
+        source2wins = defaultdict(list)
+        for data_source, score, success in zip(data_sources, task_scores, successes):
+            source = str(data_source)
+            if not source.startswith("webshop") or score is None or success is None:
+                continue
+            source2scores[source].append(float(score))
+            source2wins[source].append(1.0 if bool(success) else 0.0)
+        for source, scores in source2scores.items():
+            metrics[f"val-core/{source}/score@1"] = float(np.mean(scores))
+            metrics[f"val-core/{source}/success_rate@1"] = float(np.mean(source2wins[source]))
+            metrics[f"val-aux/{source}/task_count"] = float(len(scores))
+
+    task_names = infos_dict.get("task_name")
+    rewards = infos_dict.get("reward")
+    if task_names is None or rewards is None:
+        return metrics
+
+    family2task2rewards = defaultdict(lambda: defaultdict(list))
+    family2wins = defaultdict(list)
+    for index, (data_source, task_name, reward) in enumerate(zip(data_sources, task_names, rewards, strict=True)):
+        if task_name is None or reward is None:
+            continue
+        family = str(data_source).split("/", 1)[0]
+        family2task2rewards[family][str(task_name)].append(float(reward))
+        if successes is not None and successes[index] is not None:
+            family2wins[family].append(1.0 if bool(successes[index]) else 0.0)
+
+    for family, task2rewards in family2task2rewards.items():
+        prefix = f"{family}/overall"
+        metrics[f"val-core/{prefix}/reward/macro_mean@1"] = float(np.mean([np.mean(v) for v in task2rewards.values()]))
+        if family2wins[family]:
+            metrics[f"val-core/{prefix}/solved_rate@1"] = float(np.mean(family2wins[family]))
+        metrics[f"val-aux/{prefix}/task_count"] = float(len(task2rewards))
+        metrics[f"val-aux/{prefix}/case_count"] = float(sum(len(v) for v in task2rewards.values()))
+    return metrics

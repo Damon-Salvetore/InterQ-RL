@@ -92,3 +92,15 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+  # FP8 scale format, must match the rollout: "fp32", "e8m0", or "auto" (follow VLLM_USE_DEEP_GEMM_E8M0)
+  scale_format: "auto"
+
+  # E8M0 scale rounding: "ceil", "stochastic_weight", or "stochastic"
+  scale_round: "ceil"
+
+  # Fake-quantize K/V per token and head; enable only with rollout kv_cache_dtype=fp8_per_token_head
+  quantize_kv_cache: False
+
+  # FP8 QAT backward operands: "save" keeps QDQ tensors, "recompute" rematerializes them in backward
+  backward_operand_policy: "save"

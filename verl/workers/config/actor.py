@@ -98,6 +98,18 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    # AIS
+    ais_clip: float = 5.0
+    ais_delta: float = 0.02
+    ais_gamma: float = 1.2
+    ais_beta_var: float = 1.0
+    ais_epsilon: float = 1e-6
+    # QuRL ACR
+    acr_cap: float = 2.0
+    # InterQ-RL execution-prefix correction
+    interq_eps_low: float = 0.025
+    interq_eps_high: float = 0.05
+    interq_exponent: float = 0.5
 
 
 @dataclass

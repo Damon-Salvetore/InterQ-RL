@@ -82,6 +82,15 @@ actor_rollout_ref:
       clip_cov_ub: 5.0
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
+      ais_clip: 5.0
+      ais_delta: 0.02
+      ais_gamma: 1.2
+      ais_beta_var: 1.0
+      ais_epsilon: 1.0e-06
+      acr_cap: 2.0
+      interq_eps_low: 0.025
+      interq_eps_high: 0.05
+      interq_exponent: 0.5
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

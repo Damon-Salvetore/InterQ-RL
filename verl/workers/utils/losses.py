@@ -86,6 +86,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
+    if "acr_clip_r" in data:
+        fields.append("acr_clip_r")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
     data = data.select(*fields).to_padded_tensor()
@@ -101,7 +103,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
+    policy_loss_kwargs = dict(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -110,6 +112,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
+    if loss_mode == "qurl":
+        policy_loss_kwargs["acr_clip_r"] = data.get("acr_clip_r", None)
+    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower

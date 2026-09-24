@@ -1,0 +1,5 @@
+TransferQueue==0.1.8
+alfworld==0.4.2
+textworld==1.7.0
+scienceworld==1.2.3
+py4j==0.10.9.9

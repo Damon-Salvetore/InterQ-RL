@@ -1,0 +1,5 @@
+- name: alfworld_agent
+  _target_: agent_system.environments.alfworld.alfworld_agent_loop.AlfworldAgentLoop
+  max_steps: 30
+  max_episode_steps: 30
+  data_root: ${oc.env:ALFWORLD_DATA_ROOT,data/alfworld}

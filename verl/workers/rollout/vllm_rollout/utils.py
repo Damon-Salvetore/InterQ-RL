@@ -26,7 +26,7 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.plugin.platform import get_platform
-from verl.utils.device import is_npu_available
+from verl.utils.device import get_torch_device, is_npu_available
 from verl.utils.megatron_peft_utils import remove_base_layer_from_name, resolve_base_layer_name
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -208,6 +208,23 @@ class vLLMColocateWorkerExtension:
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
+
+    def empty_cache(self) -> dict[str, int]:
+        """Return cached pages and snapshot memory before vLLM remaps VMM arenas."""
+        device = get_torch_device()
+        device.synchronize()
+        device.empty_cache()
+        mem_get_info = getattr(device, "mem_get_info", None)
+        free_bytes, total_bytes = mem_get_info() if callable(mem_get_info) else (0, 0)
+        memory_allocated = getattr(device, "memory_allocated", None)
+        memory_reserved = getattr(device, "memory_reserved", None)
+        return {
+            "local_rank": int(self.local_rank),
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "allocated_bytes": int(memory_allocated()) if callable(memory_allocated) else 0,
+            "reserved_bytes": int(memory_reserved()) if callable(memory_reserved) else 0,
+        }
 
     def _get_drafter_model(self):
         """Return the drafter's model object, or None if unavailable."""
@@ -487,6 +504,9 @@ class vLLMColocateWorkerExtension:
 
                 for model, model_config in self._iter_all_models_with_config():
                     process_weights_after_loading(model, model_config, self.device)
+
+        # vLLM remaps its weight/KV arenas right after this returns; pending CUDA work must finish first.
+        get_torch_device().synchronize()
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

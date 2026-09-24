@@ -215,6 +215,7 @@ class McoreModuleWrapperConfig:
     wrap_with_ddp: bool = True
     use_distributed_optimizer: bool = True
     use_megatron_fsdp: bool = False
+    data_parallel_random_init: bool = True
 
 
 def make_megatron_module(
@@ -254,8 +255,7 @@ def make_megatron_module(
         if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):
             post_model_creation_callbacks.append(freeze_moe_router)
         if provider is not None:
-            from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
-            from megatron.bridge.training.utils.config_utils import create_ddp_config
+            from verl.models.mcore.bridge import create_ddp_config
 
             # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
             # BEFORE wrapping the model in DDP. This is required because:
@@ -267,6 +267,7 @@ def make_megatron_module(
             # Register PEFT transformation as pre-wrap hook if peft_cls is specified
             # This must happen BEFORE DDP wrapping to avoid KeyError with frozen parameters
             if peft_cls is not None:
+                from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
                 from verl.utils.megatron_peft_utils import print_adapter_info
 
                 provider.register_pre_wrap_hook(create_peft_hook(peft_cls, training=True))
@@ -313,6 +314,7 @@ def make_megatron_module(
                 fp16=provider.fp16,
                 bf16=provider.bf16,
                 use_megatron_fsdp=wrap_config.use_megatron_fsdp,
+                data_parallel_random_init=wrap_config.data_parallel_random_init,
             )
 
             # Extract TransformerConfig from the created model

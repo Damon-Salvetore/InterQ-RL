@@ -136,6 +136,10 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
+        scale_format (str): FP8 scale format matching the rollout, "fp32", "e8m0" or "auto"
+        scale_round (str): E8M0 scale rounding, "ceil", "stochastic_weight" or "stochastic"
+        quantize_kv_cache (bool): Fake-quantize K/V per token and head
+        backward_operand_policy (str): "save" or "recompute" QDQ operands for backward
     """
 
     enable: bool = False
@@ -144,6 +148,10 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    scale_format: str = "auto"
+    scale_round: str = "ceil"
+    quantize_kv_cache: bool = False
+    backward_operand_policy: str = "save"
 
 
 @dataclass

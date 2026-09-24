@@ -78,7 +78,8 @@ class ReplayBuffer:
     - running: all sessions of the prompt are running.
     - finished: all sessions of the prompt are finished without error.
     - failure: all sessions of the prompt are finished, but at least one session failed.
-    Only prompt with status `finished` or `failure`, its trajectories can be sampled by replay buffer.
+    Only prompts with status `finished` can be sampled. Failed groups are
+    cleared and refilled before selection.
 
     Args:
         trainer_mode (str): Trainer mode.
@@ -87,8 +88,8 @@ class ReplayBuffer:
         max_off_policy_strategy (str): How to handle trajectory that exceeds the maximum number of model versions.
         sampler_kwargs (dict): Additional kwargs for the custom sampler.
         poll_interval (float, optional): Poll interval in seconds. Defaults to 2.0.
-        refill_fn (callable, optional): Function to submits fresh prompts for generation to replace stale groups dropped
-            by the ``drop`` strategy (trainer-injected)
+        refill_fn (callable, optional): Function to submits fresh prompts for generation to replace failed groups and
+            stale groups dropped by the ``drop`` strategy (trainer-injected)
     """
 
     def __init__(
@@ -163,7 +164,7 @@ class ReplayBuffer:
 
     def _sampleable_terminal_keys(self, global_steps: int, partition_id: str) -> set[str]:
         """Terminal prompts eligible for selection in the current metadata snapshot."""
-        terminal_keys = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        terminal_keys = self.finished_keys[partition_id]
         if self.max_off_policy_strategy != "drop":
             return terminal_keys
 
@@ -172,6 +173,25 @@ class ReplayBuffer:
             uid
             for uid in terminal_keys
             if global_steps - prompt_global_steps.get(uid, global_steps) + 1 <= self.max_off_policy_threshold
+        }
+
+    def _drop_failed(self, partition_id: str) -> tuple[int, dict]:
+        """Clear partial trajectories from failed GRPO groups."""
+        failure_uids = set(self.failure_keys[partition_id])
+        if not failure_uids:
+            return 0, {}
+        trajectory_keys = [
+            key
+            for key in self.partitions[partition_id]
+            if key.split("_")[0] in failure_uids
+        ]
+        tq.kv_clear(
+            partition_id=partition_id,
+            keys=list(failure_uids) + trajectory_keys,
+        )
+        prefix = "training" if partition_id == "train" else "validation"
+        return len(failure_uids), {
+            f"{prefix}/rollout_failure/dropped_samples": len(failure_uids)
         }
 
     def _has_enough_samples(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
@@ -185,13 +205,13 @@ class ReplayBuffer:
         return len(self._sampleable_terminal_keys(global_steps, partition_id)) >= batch_size
 
     def _drop_stale_finished(self, global_steps: int, partition_id: str) -> tuple[int, dict]:
-        """Drop terminal (finished/failure) prompts whose version span exceeds the threshold."""
+        """Drop finished prompts whose version span exceeds the threshold."""
         # TODO: drop strategy only takes effect after the whole group is finished, which may be too late.
         if self.max_off_policy_strategy != "drop":
             return 0, {}
 
         prompt_global_steps = self.prompt_global_steps[partition_id]
-        terminal_uids = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        terminal_uids = self.finished_keys[partition_id]
         stale_uids = terminal_uids - self._sampleable_terminal_keys(global_steps, partition_id)
 
         if not stale_uids:
@@ -240,7 +260,6 @@ class ReplayBuffer:
             KVBatchMeta: A batch of data.
             dict: Auxiliary metrics.
         """
-        # TODO: failure samples dropping and refilling
         last_debug_time = time.time()
         drop_metrics: dict = {}
         selected_prompt_uids: list[str] = []
@@ -250,6 +269,25 @@ class ReplayBuffer:
         while True:
             # Drop, gating, and selection below must all use this snapshot.
             self._sync_metadata_from_transfer_queue()
+
+            failed, failure_metrics = self._drop_failed(partition_id)
+            if failed > 0:
+                _accumulate_drop_metrics(
+                    drop_metrics,
+                    failure_metrics,
+                    failed,
+                )
+                if partition_id == "val":
+                    raise RuntimeError(
+                        f"Validation contains {failed} failed rollout groups"
+                    )
+                if self.refill_fn is None:
+                    raise RuntimeError(
+                        f"{failed} failed rollout groups require refill, "
+                        "but no refill_fn is configured"
+                    )
+                self.refill_fn(failed)
+                continue
 
             dropped, metrics = self._drop_stale_finished(global_steps, partition_id)
             if dropped > 0:

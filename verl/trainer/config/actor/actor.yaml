@@ -75,6 +75,21 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # AIS (loss_mode=ais)
+  ais_clip: 5.0
+  ais_delta: 0.02
+  ais_gamma: 1.2
+  ais_beta_var: 1.0
+  ais_epsilon: 1.0e-6
+
+  # QuRL ACR (loss_mode=qurl)
+  acr_cap: 2.0
+
+  # InterQ-RL execution-prefix correction (loss_mode=interq_rl)
+  interq_eps_low: 0.025
+  interq_eps_high: 0.05
+  interq_exponent: 0.5
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
